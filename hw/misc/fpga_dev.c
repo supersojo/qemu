@@ -74,15 +74,11 @@ typedef struct FpgaDevState {
     uint32_t tx_tail;
     uint32_t tx_ring_size;
  
-    QemuThread rx_thread;
-    QemuThread tx_thread;
-    QemuMutex thr_mutex;
-    QemuCond thr_cond;
+    QemuThread tap_thread;
 
     uint32_t msi_enabled;
 
-    uint32_t rx_seq;
-    uint32_t tx_seq;
+    uint32_t tap_seq;
     QemuMutex fpga_mutex;
     uint32_t regs[16];
 } FpgaDevState;
@@ -99,15 +95,9 @@ static void handle_reset(FpgaDevState *s) {
     s->regs[Cmd] &= ~(RxOn|TxOn);
     qemu_mutex_unlock(&s->fpga_mutex);
 
-    seq = s->rx_seq;
+    seq = s->tap_seq;
     /* wait rx thread to complete */
-    while (seq == s->rx_seq) {
-        usleep(1);
-    }
-
-    seq = s->tx_seq;
-    /* wait tx thread to complete */
-    while (seq == s->tx_seq) {
+    while (seq == s->tap_seq) {
         usleep(1);
     }
 }
@@ -365,12 +355,7 @@ static void handle_rx(FpgaDevState *s) {
 
         status_reply |= (len&0x1fff);
     } else {
-        if (errno==EAGAIN)
-        {
-            /* read return with no packet now */
-            return;
-        }
-
+        /* errno?? */
         status_reply |= RxError;
     }
 
@@ -402,36 +387,6 @@ static void handle_rx(FpgaDevState *s) {
         s->rx_tail++;
 }
 
-
-static void *fpga_rx_thread(void *opaque) {
-    FpgaDevState *s = opaque;
-
-    //printf("fpga rx thread is running...\n");
-
-    while (1) {
-        qemu_mutex_lock(&s->fpga_mutex);
-
-        if (FpgaReg(Cmd) & RxOn) {
-            qemu_mutex_unlock(&s->fpga_mutex);
-            handle_rx(s);
-
-            usleep(1000);
-
-            continue;
-        }
-
-        qemu_mutex_unlock(&s->fpga_mutex);
-
-        /* update sequence lock for fpga reset command */
-        s->rx_seq++;
-
-        /* make cpu happy */
-        usleep(1000);
-    }
-
-    return NULL;
-}
-
 static void handle_tx(FpgaDevState *s) {
     static uint8_t buffer[2048];/* TBD: Is it big enough? */
     uint32_t addr; /* buffer_desc address */
@@ -454,7 +409,8 @@ static void handle_tx(FpgaDevState *s) {
      * wait for available buffers
      */
     if (!(status&DescOwn)) {
-        /* no more buffer desc */
+        /* TBD: no more buffer desc, trigger interrupt?? */
+        usleep(1000);/* make cpu happy but increase latency */
         return;
     }
 
@@ -518,33 +474,61 @@ static void handle_tx(FpgaDevState *s) {
         s->tx_tail++;
 }
 
-static void *fpga_tx_thread(void *opaque) {
+static void *fpga_tap_thread(void *opaque) {
+    fd_set read_fds, write_fds, error_fds;
+    struct timeval timeout;
     FpgaDevState *s = opaque;
 
-    //printf("fpga tx thread is running...\n");
-
+    
     while (1) {
-        qemu_mutex_lock(&s->fpga_mutex);
+        // Initialize fd_sets
+        FD_ZERO(&read_fds);
+        FD_ZERO(&write_fds);
+        FD_ZERO(&error_fds);
 
-        if (FpgaReg(Cmd) & TxOn) {
-            qemu_mutex_unlock(&s->fpga_mutex);
-            handle_tx(s);
+        FD_SET(s->tap_fd, &read_fds);
+        FD_SET(s->tap_fd, &write_fds);
+        FD_SET(s->tap_fd, &error_fds);
 
-            usleep(1000);
-
-            continue;
+        // Set timeout
+        timeout.tv_sec = 1; // 1 second
+        timeout.tv_usec = 0;
+        
+        int ready = select(s->tap_fd + 1, &read_fds, &write_fds, &error_fds, &timeout);
+        if (ready < 0) {
+            perror("Select failed");
+            close(s->tap_fd);
+            exit(-1);
         }
 
-        qemu_mutex_unlock(&s->fpga_mutex);
+        // Handle readable socket
+        if (FD_ISSET(s->tap_fd, &read_fds)) {
+            qemu_mutex_lock(&s->fpga_mutex);
+            if (FpgaReg(Cmd) & RxOn) {
+                qemu_mutex_unlock(&s->fpga_mutex);
+                handle_rx(s);
+            } else {
+                qemu_mutex_unlock(&s->fpga_mutex);
+                usleep(1000);/* make cpu happy */
+            }
+        }
+
+        // Handle writable socket
+        if (FD_ISSET(s->tap_fd, &write_fds)) {
+            qemu_mutex_lock(&s->fpga_mutex);
+            if (FpgaReg(Cmd) & TxOn) {
+                qemu_mutex_unlock(&s->fpga_mutex);
+                handle_tx(s);
+            } else { 
+                qemu_mutex_unlock(&s->fpga_mutex);
+                usleep(1000);/* make cpu happy */
+            }
+        }
 
         /* update sequence lock for fpga reset command */
-        s->tx_seq++;
+        s->tap_seq++;
 
-        /* make cpu happy */
-        usleep(1000);
     }
-
-    return NULL;
 }
 
 // Property definitions
@@ -675,10 +659,7 @@ static void fpga_dev_realize(PCIDevice *pci_dev, Error **errp) {
 
     // 初始化寄存器值
 
-    qemu_thread_create(&s->rx_thread, "fpga-rx", fpga_rx_thread,
-            s, QEMU_THREAD_JOINABLE);
-
-    qemu_thread_create(&s->tx_thread, "fpga-tx", fpga_tx_thread,
+    qemu_thread_create(&s->tap_thread, "fpga-tap", fpga_tap_thread,
             s, QEMU_THREAD_JOINABLE);
 }
 
