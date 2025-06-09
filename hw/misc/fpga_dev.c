@@ -295,8 +295,10 @@ static void fpga_trigger_interrupt(FpgaDevState *s)
     if (msi_enabled(pci_dev)) {
         msi_notify(pci_dev, 0); /* 触发第 0 个中断向量 */
     } else {
-        /* 回退到传统中断（INTx） */
-        pci_set_irq(pci_dev, 1);
+        /* 回退到传统中断（INTx） 
+         * dynamic enable/disable msi cause error
+         */
+        //pci_set_irq(pci_dev, 1);
     }
 }
 
